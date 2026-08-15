@@ -1,0 +1,348 @@
+# Build KernelSU-Next for Xiaomi Redmi Note 8 Pro (begonia)
+# Target ROM: PixelExperience 12.1 (2022-08-29)
+#
+# Verified facts used in this workflow:
+#
+#   Kernel repository : https://github.com/PixelExperience-Devices/kernel_xiaomi_begonia
+#   Branch            : twelve
+#   Kernel commit     : fea8399630764ef7afe3a19172a549fff92dc9d0
+#     - Last commit on the twelve branch confirmed before the 2022-08-29 ROM build.
+#   Kernel version    : Linux 4.14.274
+#     - Confirmed from Makefile (VERSION=4, PATCHLEVEL=14, SUBLEVEL=274).
+#   Defconfig         : begonia_user_defconfig
+#     - Confirmed in BoardConfig.mk (TARGET_KERNEL_CONFIG) and present at
+#       arch/arm64/configs/begonia_user_defconfig in the kernel tree.
+#   Kernel image      : Image.gz
+#     - Confirmed from BoardConfig.mk: BOARD_KERNEL_IMAGE_NAME := Image.gz
+#   Compiler          : AOSP clang-r416183b (Clang 12.0.7)
+#     - Official AOSP Android 12 prebuilt toolchain from:
+#       https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
+#     - Tag: android-12.1.0_r22
+#     - Path in prebuilts: clang/host/linux-x86/clang-r416183b
+#   KernelSU-Next     : v3.2.0-legacy
+#     - Explicit tag for non-GKI / Linux 4.14 kernels in KernelSU-Next/KernelSU-Next.
+#     - Commit: 9b08e88862000d5c50fb2e43a5b75123cf472e54
+#   KSU integration   : Official setup.sh (non-GKI / legacy method).
+#     - Script is run from the kernel root as documented by KernelSU-Next.
+#     - Full clone (not shallow) because setup.sh requires git history for
+#       version tagging inside the driver.
+#   AnyKernel3        : osm0sis/AnyKernel3
+
+name: Build Begonia KernelSU Next
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: "begonia — Linux 4.14 + KernelSU-Next (PE 12.1)"
+    runs-on: ubuntu-22.04
+
+    env:
+      # ── Kernel source (verified) ───────────────────────────────────────────
+      KERNEL_REPO:    "https://github.com/PixelExperience-Devices/kernel_xiaomi_begonia"
+      KERNEL_BRANCH:  "twelve"
+      KERNEL_COMMIT:  "fea8399630764ef7afe3a19172a549fff92dc9d0"
+      KERNEL_VERSION: "4.14.274"
+      ARCH:           "arm64"
+      # ── Defconfig (verified from BoardConfig.mk and kernel tree) ──────────
+      DEFCONFIG:      "begonia_user_defconfig"
+      # ── Kernel image format (verified from BoardConfig.mk) ─────────────────
+      KERNEL_IMAGE:   "Image.gz"
+      # ── KernelSU-Next (non-GKI legacy tag) ─────────────────────────────────
+      KERNELSU_REPO:   "https://github.com/KernelSU-Next/KernelSU-Next"
+      KERNELSU_TAG:    "v3.2.0-legacy"
+      KERNELSU_COMMIT: "9b08e88862000d5c50fb2e43a5b75123cf472e54"
+      # ── AOSP clang-r416183b toolchain ─────────────────────────────────────
+      CLANG_NAME:     "clang-r416183b"
+      CLANG_PREBUILTS_REPO: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86"
+      CLANG_PREBUILTS_TAG:  "android-12.1.0_r22"
+
+    steps:
+      # ── 1. Install build dependencies ─────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates curl flex git \
+            libelf-dev libssl-dev python3 zip \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi
+
+      # ── 2. Download AOSP clang-r416183b (Android 12 prebuilt toolchain) ───
+      #
+      # We fetch only the single clang-r416183b subdirectory from the
+      # prebuilts/clang/host/linux-x86 repository using a sparse checkout so
+      # we do not download all clang variants (~40 GB total).
+      - name: Download AOSP clang-r416183b toolchain
+        run: |
+          git clone \
+            --depth=1 \
+            --filter=blob:none \
+            --sparse \
+            --branch "${CLANG_PREBUILTS_TAG}" \
+            "${CLANG_PREBUILTS_REPO}" \
+            clang-prebuilts
+          cd clang-prebuilts
+          git sparse-checkout set "clang/${CLANG_NAME}"
+          git checkout
+
+          CLANG_BIN="$(pwd)/clang/${CLANG_NAME}/bin"
+          if [ ! -d "${CLANG_BIN}" ]; then
+            echo "ERROR: AOSP clang-r416183b bin/ directory not found at ${CLANG_BIN}"
+            exit 1
+          fi
+          echo "CLANG_BIN=${CLANG_BIN}" >> "${GITHUB_ENV}"
+          echo "CLANG_DIR=$(pwd)/clang/${CLANG_NAME}" >> "${GITHUB_ENV}"
+
+      # ── 3. Print verified build information ───────────────────────────────
+      - name: Print build information
+        run: |
+          export PATH="${CLANG_BIN}:${PATH}"
+
+          CC_VERSION=$(clang --version | head -1 || true)
+          LD_VERSION=$(ld.lld --version | head -1 || true)
+
+          echo "════════════════════════════════════════════════════════════"
+          echo "  Kernel repository  : ${KERNEL_REPO}"
+          echo "  Kernel branch      : ${KERNEL_BRANCH}"
+          echo "  Kernel commit      : ${KERNEL_COMMIT}"
+          echo "  Kernel version     : Linux ${KERNEL_VERSION}"
+          echo "  Defconfig          : ${DEFCONFIG}"
+          echo "  Compiler           : ${CC_VERSION}"
+          echo "  Linker             : ${LD_VERSION}"
+          echo "  CROSS_COMPILE      : aarch64-linux-gnu-"
+          echo "  CROSS_COMPILE_ARM32: arm-linux-gnueabi-"
+          echo "  KernelSU-Next      : ${KERNELSU_TAG}"
+          echo "  KernelSU-Next commit: ${KERNELSU_COMMIT}"
+          echo "  Architecture       : ${ARCH}"
+          echo "  Kernel image       : ${KERNEL_IMAGE}"
+          echo "════════════════════════════════════════════════════════════"
+
+      # ── 4. Clone kernel source and verify exact commit ────────────────────
+      - name: Clone kernel source at verified commit
+        run: |
+          git clone --depth=50 --branch "${KERNEL_BRANCH}" \
+            "${KERNEL_REPO}" kernel
+          cd kernel
+          git checkout "${KERNEL_COMMIT}"
+          ACTUAL_COMMIT=$(git rev-parse HEAD)
+          if [ "${ACTUAL_COMMIT}" != "${KERNEL_COMMIT}" ]; then
+            echo "ERROR: Kernel commit mismatch."
+            echo "  Expected : ${KERNEL_COMMIT}"
+            echo "  Actual   : ${ACTUAL_COMMIT}"
+            echo "STOP: Refusing to build from an unverified commit."
+            exit 1
+          fi
+          echo "Kernel commit verified: ${KERNEL_COMMIT}"
+
+      # ── 5. Verify kernel version and defconfig ────────────────────────────
+      - name: Verify kernel version and defconfig
+        run: |
+          cd kernel
+
+          # Check Linux version from Makefile
+          KV_VERSION=$(grep -m1 '^VERSION\s*=' Makefile | awk -F'=' '{print $2}' | tr -d ' ')
+          KV_PATCH=$(grep -m1 '^PATCHLEVEL\s*=' Makefile | awk -F'=' '{print $2}' | tr -d ' ')
+          KV_SUB=$(grep -m1 '^SUBLEVEL\s*=' Makefile | awk -F'=' '{print $2}' | tr -d ' ')
+          ACTUAL_VERSION="${KV_VERSION}.${KV_PATCH}.${KV_SUB}"
+
+          echo "Kernel Makefile version: ${ACTUAL_VERSION}"
+          if [ "${ACTUAL_VERSION}" != "${KERNEL_VERSION}" ]; then
+            echo "ERROR: Kernel version mismatch."
+            echo "  Expected : ${KERNEL_VERSION}"
+            echo "  Actual   : ${ACTUAL_VERSION}"
+            exit 1
+          fi
+          echo "Kernel version verified: ${ACTUAL_VERSION}"
+
+          # Check defconfig exists
+          DEFCONFIG_PATH="arch/arm64/configs/${DEFCONFIG}"
+          if [ ! -f "${DEFCONFIG_PATH}" ]; then
+            echo "ERROR: Defconfig not found at ${DEFCONFIG_PATH}"
+            exit 1
+          fi
+          echo "Defconfig verified: ${DEFCONFIG_PATH}"
+
+      # ── 6. Integrate KernelSU-Next using the official non-GKI method ──────
+      #
+      # The official KernelSU-Next non-GKI integration runs setup.sh from the
+      # kernel root. setup.sh:
+      #   - Creates a 'KernelSU' directory (or symlink) inside the kernel tree
+      #   - Patches drivers/Makefile and drivers/Kconfig
+      #   - On Linux 4.x without CONFIG_KPROBES, auto-selects manual hook mode
+      #
+      # A full clone (not shallow) is required because setup.sh uses `git
+      # describe` inside the KernelSU-Next repository to embed the version
+      # string into the driver; a shallow clone may fail to find the tag.
+      - name: Integrate KernelSU-Next (official non-GKI method)
+        run: |
+          cd kernel
+
+          # Clone KernelSU-Next with full history so setup.sh can resolve tags
+          git clone --branch "${KERNELSU_TAG}" \
+            "${KERNELSU_REPO}" KernelSU-Next
+
+          # Verify the checked-out commit matches the expected value
+          KSU_ACTUAL_COMMIT=$(cd KernelSU-Next && git rev-parse HEAD)
+          echo "KernelSU-Next HEAD: ${KSU_ACTUAL_COMMIT}"
+          if [ "${KSU_ACTUAL_COMMIT}" != "${KERNELSU_COMMIT}" ]; then
+            echo "ERROR: KernelSU-Next commit mismatch."
+            echo "  Expected : ${KERNELSU_COMMIT}"
+            echo "  Actual   : ${KSU_ACTUAL_COMMIT}"
+            exit 1
+          fi
+          echo "KernelSU-Next commit verified: ${KERNELSU_COMMIT}"
+
+          # Run the official setup script from the kernel root
+          bash KernelSU-Next/kernel/setup.sh "${KERNELSU_TAG}"
+
+          # Verify the integration results
+          if [ ! -L drivers/kernelsu ] && [ ! -d drivers/kernelsu ]; then
+            echo "ERROR: drivers/kernelsu not created by setup.sh"
+            exit 1
+          fi
+          grep -q "kernelsu" drivers/Makefile \
+            || { echo "ERROR: drivers/Makefile not patched by setup.sh"; exit 1; }
+          grep -q "drivers/kernelsu/Kconfig" drivers/Kconfig \
+            || { echo "ERROR: drivers/Kconfig not patched by setup.sh"; exit 1; }
+
+          echo "KernelSU-Next integrated via official setup.sh."
+          echo "  Tag    : ${KERNELSU_TAG}"
+          echo "  Commit : ${KERNELSU_COMMIT}"
+
+      # ── 7. Build the kernel ───────────────────────────────────────────────
+      - name: Build kernel
+        run: |
+          cd kernel
+
+          export PATH="${CLANG_BIN}:${PATH}"
+
+          MAKE_FLAGS=(
+            "ARCH=${ARCH}"
+            "CC=clang"
+            "LD=ld.lld"
+            "AR=llvm-ar"
+            "NM=llvm-nm"
+            "OBJCOPY=llvm-objcopy"
+            "OBJDUMP=llvm-objdump"
+            "STRIP=llvm-strip"
+            "CLANG_TRIPLE=aarch64-linux-gnu-"
+            "CROSS_COMPILE=aarch64-linux-gnu-"
+            "CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+            "LLVM=1"
+            "LLVM_IAS=1"
+            "O=out"
+          )
+
+          echo "--- Compiler version ---"
+          clang --version
+          echo "--- Linker version ---"
+          ld.lld --version
+
+          echo "--- Generating .config from ${DEFCONFIG} ---"
+          make "${MAKE_FLAGS[@]}" "${DEFCONFIG}"
+
+          # Enable KernelSU and OverlayFS (required by KernelSU at runtime)
+          echo "--- Enabling CONFIG_KSU and CONFIG_OVERLAY_FS ---"
+          scripts/config --file out/.config \
+            -e KSU \
+            -e OVERLAY_FS
+
+          # Re-read config to resolve any new dependencies
+          make "${MAKE_FLAGS[@]}" olddefconfig
+
+          # Confirm KSU is enabled in the final config
+          grep -q "CONFIG_KSU=y" out/.config \
+            || { echo "ERROR: CONFIG_KSU not enabled in final config"; exit 1; }
+          echo "CONFIG_KSU=y confirmed in final config."
+
+          echo "--- Building ${KERNEL_IMAGE} ---"
+          make "${MAKE_FLAGS[@]}" -j"$(nproc)" "${KERNEL_IMAGE}"
+
+          # Verify the image was produced
+          IMAGE_PATH="out/arch/${ARCH}/boot/${KERNEL_IMAGE}"
+          if [ ! -f "${IMAGE_PATH}" ]; then
+            echo "ERROR: ${KERNEL_IMAGE} not found at ${IMAGE_PATH}"
+            exit 1
+          fi
+
+          echo "--- Build successful ---"
+          ls -lh "${IMAGE_PATH}"
+
+          # Verify it is a valid ARM64 kernel image
+          IMAGE_TYPE=$(file "${IMAGE_PATH}")
+          echo "Image type: ${IMAGE_TYPE}"
+          # Image.gz is a gzip-compressed ARM64 kernel; verify gzip magic bytes
+          MAGIC=$(xxd -l 2 "${IMAGE_PATH}" | awk '{print $2$3}')
+          if [ "${MAGIC}" != "1f8b" ]; then
+            echo "ERROR: ${IMAGE_PATH} does not have gzip magic bytes (got: ${MAGIC})"
+            exit 1
+          fi
+          echo "Image.gz gzip magic verified."
+
+      # ── 8. Print post-build summary ───────────────────────────────────────
+      - name: Print post-build summary
+        run: |
+          export PATH="${CLANG_BIN}:${PATH}"
+
+          CC_VERSION=$(clang --version | head -1)
+          LD_VERSION=$(ld.lld --version | head -1)
+          IMAGE_PATH="kernel/out/arch/${ARCH}/boot/${KERNEL_IMAGE}"
+          IMAGE_SIZE=$(ls -lh "${IMAGE_PATH}" | awk '{print $5}')
+
+          echo "════════════════════════════════════════════════════════════"
+          echo "  BUILD SUMMARY"
+          echo "════════════════════════════════════════════════════════════"
+          echo "  Kernel repository  : ${KERNEL_REPO}"
+          echo "  Exact kernel commit: ${KERNEL_COMMIT}"
+          echo "  Kernel version     : Linux ${KERNEL_VERSION}"
+          echo "  Defconfig          : ${DEFCONFIG}"
+          echo "  Compiler version   : ${CC_VERSION}"
+          echo "  Linker version     : ${LD_VERSION}"
+          echo "  KernelSU-Next      : ${KERNELSU_TAG}"
+          echo "  KernelSU-Next commit: ${KERNELSU_COMMIT}"
+          echo "  Architecture       : ${ARCH}"
+          echo "  Generated image    : ${IMAGE_PATH} (${IMAGE_SIZE})"
+          echo "════════════════════════════════════════════════════════════"
+
+      # ── 9. Package with AnyKernel3 ────────────────────────────────────────
+      - name: Package kernel with AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          cd AnyKernel3
+
+          # Configure anykernel.sh for begonia (Redmi Note 8 Pro)
+          sed -i \
+            -e 's/kernel\.string=.*/kernel.string=KernelSU-Next for Redmi Note 8 Pro (begonia) - PE 12.1/' \
+            -e 's/do\.devicecheck=.*/do.devicecheck=1/' \
+            anykernel.sh
+
+          # Remove any pre-existing device name lines and add correct ones
+          sed -i '/^device\.name[0-9]/d' anykernel.sh
+          sed -i '/do\.devicecheck=1/a device.name1=begonia\ndevice.name2=begoniain' anykernel.sh
+
+          # Set supported Android version
+          sed -i 's/supported\.versions=.*/supported.versions=12/' anykernel.sh
+
+          # Copy the verified kernel image
+          cp ../kernel/out/arch/arm64/boot/Image.gz ./
+
+          # Create the flashable ZIP
+          ZIP_NAME="begonia-PE12.1-KernelSU-Next.zip"
+          zip -r9 "${ZIP_NAME}" . \
+            -x ".git/*" \
+            -x "*.md" \
+            -x "LICENSE"
+
+          echo "--- Flashable ZIP created ---"
+          ls -lh "${ZIP_NAME}"
+          echo "AnyKernel3 package: AnyKernel3/${ZIP_NAME}"
+
+      # ── 10. Upload artifact ───────────────────────────────────────────────
+      - name: Upload flashable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: begonia-PE12.1-KernelSU-Next
+          path: AnyKernel3/begonia-PE12.1-KernelSU-Next.zip
+          if-no-files-found: error
