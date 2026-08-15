@@ -1,0 +1,385 @@
+# Build KernelSU-Next for Xiaomi Redmi Note 8 Pro (begonia)
+# Target ROM: PixelExperience 12.1 (2022-08-29)
+#
+# Verified facts used in this workflow:
+#
+#   Kernel repository : https://github.com/PixelExperience-Devices/kernel_xiaomi_begonia
+#   Branch            : twelve
+#   Kernel commit     : fea8399630764ef7afe3a19172a549fff92dc9d0
+#     — Last commit on the twelve branch (2022-04-29), confirmed HEAD before the
+#       2022-08-29 ROM build by querying commits since=2022-08-01 (returned zero).
+#   Kernel version    : Linux 4.14.274
+#     — Confirmed from Makefile (VERSION=4, PATCHLEVEL=14, SUBLEVEL=274).
+#   Defconfig         : begonia_user_defconfig
+#     — Confirmed in BoardConfig.mk (TARGET_KERNEL_CONFIG) and present at
+#       arch/arm64/configs/begonia_user_defconfig in the kernel tree.
+#   Kernel image      : Image.gz
+#     — Confirmed from BoardConfig.mk: BOARD_KERNEL_IMAGE_NAME := Image.gz
+#   Compiler          : Clang 12 (Ubuntu 22.04 package clang-12)
+#     — Matches the AOSP Android 12 prebuilt clang-r416183b = 12.0.7, which is the
+#       compiler used by PixelExperience 12.1 builds (android-12.1.0_r22 base).
+#   Cross-compile     : gcc-aarch64-linux-gnu (arm64), gcc-arm-linux-gnueabi (arm32)
+#   KernelSU-Next     : v3.2.0-legacy
+#     — Explicit tag for non-GKI / Linux 4.14 kernels in KernelSU-Next/KernelSU-Next.
+#     — SHA: 9b08e88862000d5c50fb2e43a5b75123cf472e54
+#   Manual hooks      : Required because begonia_user_defconfig does not set
+#                       CONFIG_KPROBES; the Kbuild for v3.2.0-legacy auto-enables
+#                       CONFIG_KSU_MANUAL_HOOK and hard-errors if the kernel source
+#                       does not contain "ksu_handle_sys_reboot" in kernel/reboot.c.
+#                       Hooks are patched into reboot.c, exec.c, open.c,
+#                       read_write.c, and stat.c per the KernelSU non-GKI guide.
+#   AnyKernel3        : osm0sis/AnyKernel3
+
+name: Build Begonia KernelSU Next
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: "begonia — Linux 4.14 + KernelSU-Next (PE 12.1)"
+    runs-on: ubuntu-22.04
+
+    env:
+      # ── Kernel source (verified) ───────────────────────────────────────────
+      KERNEL_REPO:    "https://github.com/PixelExperience-Devices/kernel_xiaomi_begonia"
+      KERNEL_BRANCH:  "twelve"
+      # HEAD of the twelve branch; no commits were pushed after 2022-04-29,
+      # making this the exact commit used for the 2022-08-29 ROM build.
+      KERNEL_COMMIT:  "fea8399630764ef7afe3a19172a549fff92dc9d0"
+      KERNEL_VERSION: "4.14.274"
+      ARCH:           "arm64"
+      # ── Defconfig (verified from BoardConfig.mk and kernel tree) ──────────
+      DEFCONFIG:      "begonia_user_defconfig"
+      # ── Kernel image format (verified from BoardConfig.mk) ─────────────────
+      KERNEL_IMAGE:   "Image.gz"
+      # ── KernelSU-Next (non-GKI legacy tag) ─────────────────────────────────
+      KERNELSU_REPO:  "https://github.com/KernelSU-Next/KernelSU-Next"
+      KERNELSU_TAG:   "v3.2.0-legacy"
+      # ── Toolchain ─────────────────────────────────────────────────────────
+      # Clang 12 matches AOSP Android 12 prebuilt clang-r416183b (12.0.7).
+      CLANG_VERSION:  "12"
+
+    steps:
+      # ── 1. Install build dependencies ─────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates curl flex git \
+            libelf-dev libssl-dev python3 zip \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi \
+            clang-12 lld-12 llvm-12
+
+      # ── 2. Print verified build information ───────────────────────────────
+      - name: Print build information
+        run: |
+          echo "════════════════════════════════════════════════════════════"
+          echo "  Kernel repository  : ${KERNEL_REPO}"
+          echo "  Kernel branch      : ${KERNEL_BRANCH}"
+          echo "  Kernel commit      : ${KERNEL_COMMIT}"
+          echo "  Kernel version     : Linux ${KERNEL_VERSION}"
+          echo "  Defconfig          : ${DEFCONFIG}"
+          echo "  Compiler           : clang-${CLANG_VERSION} (AOSP Android 12 era, r416183b ≈ 12.0.7)"
+          echo "  CROSS_COMPILE      : aarch64-linux-gnu-"
+          echo "  CROSS_COMPILE_ARM32: arm-linux-gnueabi-"
+          echo "  KernelSU-Next      : ${KERNELSU_TAG} (non-GKI / Linux 4.14 legacy tag)"
+          echo "  Architecture       : ${ARCH}"
+          echo "  Device tree        : MT6785 DTBs built from kernel source"
+          echo "  Kernel image       : ${KERNEL_IMAGE}"
+          echo "════════════════════════════════════════════════════════════"
+
+      # ── 3. Clone kernel source at the verified commit ─────────────────────
+      - name: Clone kernel source at verified commit
+        run: |
+          git clone --depth=1 --branch "${KERNEL_BRANCH}" \
+            "${KERNEL_REPO}" kernel
+          cd kernel
+          ACTUAL_COMMIT=$(git rev-parse HEAD)
+          echo "HEAD of ${KERNEL_BRANCH}: ${ACTUAL_COMMIT}"
+          if [ "${ACTUAL_COMMIT}" != "${KERNEL_COMMIT}" ]; then
+            echo "ERROR: Kernel commit mismatch."
+            echo "  Expected : ${KERNEL_COMMIT}"
+            echo "  Actual   : ${ACTUAL_COMMIT}"
+            echo "STOP: Refusing to build from an unverified commit."
+            exit 1
+          fi
+          echo "Kernel commit verified: ${KERNEL_COMMIT}"
+
+      # ── 4. Integrate KernelSU-Next using the non-GKI (manual hook) method ─
+      - name: Integrate KernelSU-Next (non-GKI legacy method)
+        run: |
+          cd kernel
+
+          # Clone KernelSU-Next at the verified legacy tag
+          git clone --depth=1 --branch "${KERNELSU_TAG}" \
+            "${KERNELSU_REPO}" KernelSU-Next
+          KERNELSU_COMMIT=$(cd KernelSU-Next && git rev-parse HEAD)
+          echo "KernelSU-Next ${KERNELSU_TAG} commit: ${KERNELSU_COMMIT}"
+
+          # Run the official setup script from the kernel root.
+          # setup.sh creates:
+          #   drivers/kernelsu  →  KernelSU-Next/kernel/   (symlink)
+          # and patches drivers/Makefile and drivers/Kconfig.
+          bash KernelSU-Next/kernel/setup.sh "${KERNELSU_TAG}"
+
+          # Verify the integration
+          test -L drivers/kernelsu \
+            || { echo "ERROR: drivers/kernelsu symlink not created"; exit 1; }
+          grep -q "kernelsu" drivers/Makefile \
+            || { echo "ERROR: drivers/Makefile not patched"; exit 1; }
+          grep -q "drivers/kernelsu/Kconfig" drivers/Kconfig \
+            || { echo "ERROR: drivers/Kconfig not patched"; exit 1; }
+
+          echo "KernelSU-Next driver integrated."
+
+      # ── 5. Add manual syscall hooks required by Linux 4.14 (no KPROBES) ───
+      #
+      # begonia_user_defconfig does not enable CONFIG_KPROBES, so the
+      # KernelSU-Next Kbuild auto-selects CONFIG_KSU_MANUAL_HOOK=y and
+      # hard-errors unless the kernel source contains explicit hook calls.
+      # The Kbuild check is:
+      #   grep -q "ksu_handle_sys_reboot" kernel/reboot.c
+      #
+      # We also add the remaining sucompat hooks (exec, faccessat, stat,
+      # vfs_read) needed for full runtime root-grant functionality.
+      - name: Add KernelSU manual hooks to kernel source
+        run: |
+          cd kernel
+
+          python3 - << 'PYEOF'
+          import re, sys
+
+          def patch_file(path, marker, replacement, description):
+              with open(path, 'r') as fh:
+                  content = fh.read()
+              if marker in content:
+                  print(f"[SKIP] {description} already present in {path}")
+                  return
+              if replacement["anchor"] not in content:
+                  print(f"[ERROR] Anchor not found in {path}: {replacement['anchor']!r}",
+                        file=sys.stderr)
+                  sys.exit(1)
+              patched = content.replace(
+                  replacement["anchor"],
+                  replacement["before"] + replacement["anchor"],
+                  1
+              )
+              with open(path, 'w') as fh:
+                  fh.write(patched)
+              print(f"[OK] {description} → {path}")
+
+          # ── kernel/reboot.c ──────────────────────────────────────────────
+          # Call ksu_handle_sys_reboot before reboot_pid_ns() so that the
+          # KernelSU manager can handle special reboot commands (e.g. to grant
+          # root). Returning 0 from the handler means "handled; do not reboot".
+          patch_file(
+              "kernel/reboot.c",
+              "ksu_handle_sys_reboot",
+              {
+                  "anchor": "\tret = reboot_pid_ns(pid_ns, cmd);\n",
+                  "before": (
+                      "#ifdef CONFIG_KSU\n"
+                      "\t{\n"
+                      "\t\textern int ksu_handle_sys_reboot(\n"
+                      "\t\t\tint magic1, int magic2, unsigned int cmd,\n"
+                      "\t\t\tvoid __user **arg);\n"
+                      "\t\tvoid __user *arg_copy = arg;\n"
+                      "\t\tif (!ksu_handle_sys_reboot(magic1, magic2, cmd, &arg_copy))\n"
+                      "\t\t\treturn 0;\n"
+                      "\t}\n"
+                      "#endif\n"
+                  ),
+              },
+              "ksu_handle_sys_reboot hook"
+          )
+
+          # ── fs/exec.c ────────────────────────────────────────────────────
+          # Hook do_execve_common (Linux 4.14 name) to intercept execve/execveat.
+          # This enables the 'su' binary compatibility layer.
+          # The hook must run before security and credential checks.
+          patch_file(
+              "fs/exec.c",
+              "ksu_handle_execve_sucompat",
+              {
+                  "anchor": "\treturn __do_execve_file(fd, filename, argv, envp, flags, NULL);\n",
+                  "before": (
+                      "#ifdef CONFIG_KSU\n"
+                      "\t{\n"
+                      "\t\textern int ksu_handle_execve_sucompat(\n"
+                      "\t\t\tconst char __user **filename_user,\n"
+                      "\t\t\tint orig_nr, const struct pt_regs *regs);\n"
+                      "\t\tksu_handle_execve_sucompat(\n"
+                      "\t\t\t(const char __user **)&filename, 0, NULL);\n"
+                      "\t}\n"
+                      "#endif\n"
+                  ),
+              },
+              "ksu_handle_execve_sucompat hook"
+          )
+
+          # ── fs/open.c ────────────────────────────────────────────────────
+          # Hook do_faccessat so KernelSU can respond to "access('/system/xbin/su')"
+          # probes made by apps checking for root availability.
+          patch_file(
+              "fs/open.c",
+              "ksu_handle_faccessat",
+              {
+                  "anchor": "\taudit_faccessat(error, dfd, filename, mode);\n",
+                  "before": (
+                      "#ifdef CONFIG_KSU\n"
+                      "\t{\n"
+                      "\t\textern int ksu_handle_faccessat(\n"
+                      "\t\t\tint *dfd, const char __user **filename_user,\n"
+                      "\t\t\tint *mode, int *flags);\n"
+                      "\t\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
+                      "\t}\n"
+                      "#endif\n"
+                  ),
+              },
+              "ksu_handle_faccessat hook"
+          )
+
+          # ── fs/read_write.c ──────────────────────────────────────────────
+          # Hook vfs_read so ksud can detect reads from the 'su' path.
+          patch_file(
+              "fs/read_write.c",
+              "ksu_handle_vfs_read",
+              {
+                  "anchor": "\tret = rw_verify_area(READ, file, pos, count);\n",
+                  "before": (
+                      "#ifdef CONFIG_KSU\n"
+                      "\t{\n"
+                      "\t\textern int ksu_handle_vfs_read(\n"
+                      "\t\t\tstruct file **file_ptr, char __user **buf_ptr,\n"
+                      "\t\t\tsize_t *count_ptr, loff_t **pos_ptr);\n"
+                      "\t\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n"
+                      "\t}\n"
+                      "#endif\n"
+                  ),
+              },
+              "ksu_handle_vfs_read hook"
+          )
+
+          # ── fs/stat.c ────────────────────────────────────────────────────
+          # Hook vfs_statx (newfstatat syscall) so KernelSU can intercept stat()
+          # calls on /system/xbin/su and related paths.
+          patch_file(
+              "fs/stat.c",
+              "ksu_handle_stat",
+              {
+                  "anchor": "\terror = vfs_statx(dfd, filename, flags, &stat, STATX_BASIC_STATS);\n",
+                  "before": (
+                      "#ifdef CONFIG_KSU\n"
+                      "\t{\n"
+                      "\t\textern int ksu_handle_stat(\n"
+                      "\t\t\tint *dfd, const char __user **filename_user,\n"
+                      "\t\t\tint *flags);\n"
+                      "\t\tksu_handle_stat(&dfd, &filename, &flags);\n"
+                      "\t}\n"
+                      "#endif\n"
+                  ),
+              },
+              "ksu_handle_stat hook"
+          )
+
+          print("All manual hook patches applied.")
+          PYEOF
+
+          # Verify the Kbuild-required hook is present
+          grep -q "ksu_handle_sys_reboot" kernel/reboot.c \
+            || { echo "ERROR: ksu_handle_sys_reboot not found in kernel/reboot.c"; exit 1; }
+          echo "Kbuild hook check passed: ksu_handle_sys_reboot present in kernel/reboot.c"
+
+      # ── 6. Build the kernel ───────────────────────────────────────────────
+      - name: Build kernel
+        run: |
+          cd kernel
+
+          # Put the LLVM 12 tools first on PATH so version-suffixed commands
+          # (clang-12, ld.lld-12, etc.) resolve correctly.
+          export PATH="/usr/lib/llvm-12/bin:${PATH}"
+
+          MAKE_FLAGS=(
+            "ARCH=${ARCH}"
+            "CC=clang-12"
+            "LD=ld.lld-12"
+            "AR=llvm-ar-12"
+            "NM=llvm-nm-12"
+            "OBJCOPY=llvm-objcopy-12"
+            "OBJDUMP=llvm-objdump-12"
+            "STRIP=llvm-strip-12"
+            "CLANG_TRIPLE=aarch64-linux-gnu-"
+            "CROSS_COMPILE=aarch64-linux-gnu-"
+            "CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+            "LLVM=1"
+            "LLVM_IAS=1"
+            "O=out"
+          )
+
+          echo "--- Generating .config from ${DEFCONFIG} ---"
+          make "${MAKE_FLAGS[@]}" "${DEFCONFIG}"
+
+          # Enable KernelSU and OverlayFS (required by KernelSU mount namespace
+          # manipulation at runtime).
+          echo "--- Enabling CONFIG_KSU and CONFIG_OVERLAY_FS ---"
+          scripts/config --file out/.config \
+            -e KSU \
+            -e OVERLAY_FS
+
+          # Re-read the config to resolve any new dependencies.
+          make "${MAKE_FLAGS[@]}" olddefconfig
+
+          echo "--- Building ${KERNEL_IMAGE} ---"
+          make "${MAKE_FLAGS[@]}" -j"$(nproc)" "${KERNEL_IMAGE}"
+
+          # Verify the image was produced
+          IMAGE_PATH="out/arch/${ARCH}/boot/${KERNEL_IMAGE}"
+          if [ ! -f "${IMAGE_PATH}" ]; then
+            echo "ERROR: ${KERNEL_IMAGE} not found at ${IMAGE_PATH}"
+            exit 1
+          fi
+
+          echo "--- Build successful ---"
+          ls -lh "${IMAGE_PATH}"
+          file "${IMAGE_PATH}"
+
+      # ── 7. Package with AnyKernel3 ────────────────────────────────────────
+      - name: Package kernel with AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          cd AnyKernel3
+
+          # Patch anykernel.sh for begonia (Redmi Note 8 Pro / begoniain variant)
+          sed -i \
+            -e 's/kernel\.string=.*/kernel.string=KernelSU-Next for Redmi Note 8 Pro (begonia) - PE 12.1/' \
+            -e 's/do\.devicecheck=.*/do.devicecheck=1/' \
+            -e '/device\.name[1-9]/d' \
+            anykernel.sh
+
+          # Insert device names after the do.devicecheck line
+          sed -i '/do\.devicecheck=1/a device.name1=begonia\ndevice.name2=begoniain' anykernel.sh
+
+          # Set supported Android version
+          sed -i 's/supported\.versions=.*/supported.versions=12/' anykernel.sh
+
+          # Copy the verified kernel image
+          cp ../kernel/out/arch/arm64/boot/Image.gz ./
+
+          # Create the flashable ZIP
+          zip -r9 begonia-PE12.1-KernelSU-Next.zip . \
+            -x ".git/*" \
+            -x "*.md" \
+            -x "LICENSE"
+
+          echo "--- Flashable ZIP created ---"
+          ls -lh begonia-PE12.1-KernelSU-Next.zip
+
+      # ── 8. Upload artifact ────────────────────────────────────────────────
+      - name: Upload flashable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: begonia-PE12.1-KernelSU-Next
+          path: AnyKernel3/begonia-PE12.1-KernelSU-Next.zip
+          if-no-files-found: error
